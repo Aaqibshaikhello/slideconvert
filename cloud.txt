@@ -1,0 +1,742 @@
+// Complete Cloudflare Workers API for SlideShare Downloader
+// Convert from your existing Next.js route.ts
+
+// Rate limiting implementation for Workers
+const rateLimitMap = new Map();
+const RATE_LIMIT_WINDOW = 60000; // 1 minute
+const MAX_REQUESTS_PER_WINDOW = 10;
+
+// User agent rotation
+const USER_AGENTS = [
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:109.0) Gecko/20100101 Firefox/121.0',
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+];
+
+// Referrer rotation
+const REFERRERS = [
+  'https://www.google.com/',
+  'https://www.bing.com/',
+  'https://duckduckgo.com/',
+  'https://www.linkedin.com/',
+  'https://twitter.com/',
+  'https://www.facebook.com/',
+  'https://www.slideshare.net/',
+  ''
+];
+
+// Random delay function
+const randomDelay = (min, max) => 
+  new Promise(resolve => setTimeout(resolve, Math.floor(Math.random() * (max - min + 1)) + min));
+
+// IP-based rate limiting
+const checkRateLimit = (ip) => {
+  const now = Date.now();
+  const requests = rateLimitMap.get(ip) || [];
+  
+  // Remove old requests outside the window
+  const recentRequests = requests.filter(time => now - time < RATE_LIMIT_WINDOW);
+  
+  if (recentRequests.length >= MAX_REQUESTS_PER_WINDOW) {
+    return false;
+  }
+  
+  recentRequests.push(now);
+  rateLimitMap.set(ip, recentRequests);
+  return true;
+};
+
+// Get random user agent
+const getRandomUserAgent = () => {
+  return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+};
+
+// Get random referrer
+const getRandomReferrer = () => {
+  return REFERRERS[Math.floor(Math.random() * REFERRERS.length)];
+};
+
+// Enhanced headers to mimic real browser
+const getBrowserHeaders = (url) => {
+  const headers = {
+    'User-Agent': getRandomUserAgent(),
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'DNT': '1',
+    'Connection': 'keep-alive',
+    'Upgrade-Insecure-Requests': '1',
+    'Cache-Control': 'max-age=0',
+    'sec-ch-ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
+    'Sec-Fetch-Site': 'none',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-User': '?1',
+    'Sec-Fetch-Dest': 'document'
+  };
+
+  // Add referrer randomly
+  const referrer = getRandomReferrer();
+  if (referrer) {
+    headers['Referer'] = referrer;
+  }
+
+  return headers;
+};
+
+// Enhanced image fetching with stealth headers
+const fetchImageWithStealth = async (url) => {
+  const headers = {
+    'User-Agent': getRandomUserAgent(),
+    'Accept': 'image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Referer': 'https://www.slideshare.net/',
+    'DNT': '1',
+    'Connection': 'keep-alive',
+    'Sec-Fetch-Site': 'cross-site',
+    'Sec-Fetch-Mode': 'no-cors',
+    'Sec-Fetch-Dest': 'image',
+    'Cache-Control': 'max-age=0'
+  };
+
+  const response = await fetch(url, { headers });
+  
+  if (!response.ok) {
+    // Retry with different headers
+    await randomDelay(500, 1500);
+    const retryResponse = await fetch(url, { 
+      headers: {
+        ...headers,
+        'User-Agent': getRandomUserAgent(),
+        'Referer': getRandomReferrer()
+      }
+    });
+    
+    if (!retryResponse.ok) {
+      throw new Error(`Failed to fetch image: ${response.status}`);
+    }
+    
+    return retryResponse.arrayBuffer();
+  }
+  
+  return response.arrayBuffer();
+};
+
+// Convert images to PDF using jsPDF (browser-compatible)
+async function createPdfFromImages(images, title) {
+  try {
+    // Import jsPDF using a more reliable method for Workers
+    const jsPDFModule = await import('https://unpkg.com/jspdf@2.5.1/dist/jspdf.es.min.js');
+    const { jsPDF } = jsPDFModule;
+    
+    let pdf = null;
+    
+    for (let i = 0; i < images.length; i++) {
+      try {
+        // Fetch image data
+        const imageData = await fetchImageWithStealth(images[i]);
+        
+        // Convert ArrayBuffer to base64 data URL
+        const base64String = btoa(String.fromCharCode(...new Uint8Array(imageData)));
+        const dataUrl = `data:image/jpeg;base64,${base64String}`;
+        
+        // Create a temporary image to get dimensions
+        const canvas = new OffscreenCanvas(1, 1);
+        const ctx = canvas.getContext('2d');
+        
+        // Create ImageBitmap to get actual image dimensions
+        const imageBlob = new Blob([imageData], { type: 'image/jpeg' });
+        const imageBitmap = await createImageBitmap(imageBlob);
+        
+        // Get image dimensions in pixels
+        const imgWidth = imageBitmap.width;
+        const imgHeight = imageBitmap.height;
+        
+        // Convert pixels to points (1 point = 1/72 inch, assuming 96 DPI)
+        const ptWidth = (imgWidth * 72) / 96;
+        const ptHeight = (imgHeight * 72) / 96;
+        
+        // Determine orientation
+        const orientation = imgWidth > imgHeight ? 'landscape' : 'portrait';
+        
+        if (i === 0) {
+          // Create PDF with first image dimensions in points
+          pdf = new jsPDF({
+            orientation: orientation,
+            unit: 'pt',
+            format: [ptWidth, ptHeight]
+          });
+        } else {
+          // Add new page with current image dimensions
+          pdf.addPage([ptWidth, ptHeight], orientation);
+        }
+        
+        // Add image to fill the entire page (no margins)
+        pdf.addImage(dataUrl, 'JPEG', 0, 0, ptWidth, ptHeight);
+        
+        // Clean up
+        imageBitmap.close();
+        
+      } catch (error) {
+        console.error(`Failed to add image ${i + 1} to PDF:`, error);
+      }
+    }
+    
+    if (!pdf) {
+      throw new Error('Failed to create PDF');
+    }
+    
+    return pdf.output('blob');
+    
+  } catch (error) {
+    console.error('PDF creation failed:', error);
+    throw new Error(`PDF conversion failed: ${error.message}`);
+  }
+}
+
+// Create PowerPoint file using a simpler approach for Workers
+async function createPptFromImages(images, title) {
+  try {
+    // Use a more reliable PowerPoint generation approach
+    const JSZip = (await import('https://unpkg.com/jszip@3.10.1/dist/jszip.min.js')).default;
+    const zip = new JSZip();
+    
+    // Create basic PowerPoint structure
+    const presentationXml = createPresentationXml(title, images.length);
+    const appXml = createAppXml();
+    const coreXml = createCoreXml(title);
+    const relsXml = createRelsXml();
+    const contentTypesXml = createContentTypesXml(images.length);
+    
+    // Add core files
+    zip.file('[Content_Types].xml', contentTypesXml);
+    zip.file('_rels/.rels', relsXml);
+    zip.file('docProps/app.xml', appXml);
+    zip.file('docProps/core.xml', coreXml);
+    zip.file('ppt/presentation.xml', presentationXml);
+    zip.file('ppt/_rels/presentation.xml.rels', createPresentationRelsXml(images.length));
+    
+    // Add slides and images
+    for (let i = 0; i < images.length; i++) {
+      try {
+        // Fetch image data
+        const imageData = await fetchImageWithStealth(images[i]);
+        
+        // Get image dimensions
+        const imageBlob = new Blob([imageData], { type: 'image/jpeg' });
+        const imageBitmap = await createImageBitmap(imageBlob);
+        const imgWidth = imageBitmap.width;
+        const imgHeight = imageBitmap.height;
+        imageBitmap.close();
+        
+        // Add image to media folder
+        zip.file(`ppt/media/image${i + 1}.jpg`, imageData);
+        
+        // Create slide XML with image fitting entire slide
+        const slideXml = createSlideXml(i + 1, imgWidth, imgHeight);
+        zip.file(`ppt/slides/slide${i + 1}.xml`, slideXml);
+        zip.file(`ppt/slides/_rels/slide${i + 1}.xml.rels`, createSlideRelsXml(i + 1));
+        
+      } catch (error) {
+        console.error(`Failed to add image ${i + 1} to PPT:`, error);
+      }
+    }
+    
+    // Generate PowerPoint file
+    const pptxBlob = await zip.generateAsync({ 
+      type: 'blob',
+      mimeType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+    });
+    
+    return pptxBlob;
+    
+  } catch (error) {
+    console.error('PowerPoint creation failed:', error);
+    throw new Error(`PowerPoint conversion failed: ${error.message}`);
+  }
+}
+
+// Helper functions for PowerPoint XML generation
+function createPresentationXml(title, slideCount) {
+  let slidesXml = '';
+  for (let i = 1; i <= slideCount; i++) {
+    slidesXml += `<p:sldId id="${255 + i}" r:id="rId${i + 1}"/>`;
+  }
+  
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:presentation xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
+  <p:sldMasterIdLst><p:sldMasterId id="2147483648" r:id="rId1"/></p:sldMasterIdLst>
+  <p:sldIdLst>${slidesXml}</p:sldIdLst>
+  <p:sldSz cx="9144000" cy="6858000" type="screen4x3"/>
+  <p:notesSz cx="6858000" cy="9144000"/>
+</p:presentation>`;
+}
+
+function createSlideXml(slideNum, imgWidth, imgHeight) {
+  // Calculate dimensions to fit slide (10 inches wide = 9144000 EMUs)
+  const slideWidth = 9144000;
+  const slideHeight = 6858000;
+  
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
+  <p:cSld>
+    <p:spTree>
+      <p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
+      <p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></a:xfrm></p:grpSpPr>
+      <p:pic>
+        <p:nvPicPr><p:cNvPr id="2" name="Image ${slideNum}"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr>
+        <p:blipFill><a:blip r:embed="rId1"/><a:stretch><a:fillRect/></a:stretch></p:blipFill>
+        <p:spPr>
+          <a:xfrm><a:off x="0" y="0"/><a:ext cx="${slideWidth}" cy="${slideHeight}"/></a:xfrm>
+          <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+        </p:spPr>
+      </p:pic>
+    </p:spTree>
+  </p:cSld>
+  <p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr>
+</p:sld>`;
+}
+
+function createSlideRelsXml(slideNum) {
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image${slideNum}.jpg"/>
+</Relationships>`;
+}
+
+function createPresentationRelsXml(slideCount) {
+  let relsXml = '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster" Target="slideMasters/slideMaster1.xml"/>';
+  for (let i = 1; i <= slideCount; i++) {
+    relsXml += `<Relationship Id="rId${i + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide${i}.xml"/>`;
+  }
+  
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  ${relsXml}
+</Relationships>`;
+}
+
+function createContentTypesXml(slideCount) {
+  let slideParts = '';
+  for (let i = 1; i <= slideCount; i++) {
+    slideParts += `<Override PartName="/ppt/slides/slide${i}.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>`;
+  }
+  
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Default Extension="jpg" ContentType="image/jpeg"/>
+  <Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>
+  ${slideParts}
+  <Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>
+  <Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>
+</Types>`;
+}
+
+function createAppXml() {
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes">
+  <Application>SlideShare Downloader</Application><ScaleCrop>false</ScaleCrop><LinksUpToDate>false</LinksUpToDate>
+  <SharedDoc>false</SharedDoc><HyperlinksChanged>false</HyperlinksChanged><AppVersion>1.0</AppVersion>
+</Properties>`;
+}
+
+function createCoreXml(title) {
+  const now = new Date().toISOString();
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:dcmitype="http://purl.org/dc/dcmitype/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <dc:title>${title}</dc:title><dc:creator>SlideShare Downloader</dc:creator><cp:lastModifiedBy>SlideShare Downloader</cp:lastModifiedBy>
+  <cp:revision>1</cp:revision><dcterms:created xsi:type="dcterms:W3CDTF">${now}</dcterms:created>
+  <dcterms:modified xsi:type="dcterms:W3CDTF">${now}</dcterms:modified>
+</cp:coreProperties>`;
+}
+
+function createRelsXml() {
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/>
+  <Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/>
+</Relationships>`;
+}
+
+// Convert images to specified format
+async function convertImages(images, title, format) {
+  switch (format.toLowerCase()) {
+    case 'pdf':
+      return await createPdfFromImages(images, title);
+    case 'ppt':
+    case 'pptx':
+      return await createPptFromImages(images, title);
+    default:
+      throw new Error(`Unsupported format: ${format}`);
+  }
+}
+
+// JSON response helper with proper CORS
+function jsonResponse(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*', // Allow all origins for Cloudflare Pages
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+      'Access-Control-Max-Age': '86400',
+    }
+  });
+}
+
+// Main SlideShare processing function
+async function processSlideShare(request) {
+  try {
+    // Get client IP for rate limiting
+    const clientIP = request.headers.get('CF-Connecting-IP') || 
+                    request.headers.get('x-forwarded-for') || 
+                    '127.0.0.1';
+
+    // Check rate limit
+    if (!checkRateLimit(clientIP)) {
+      return jsonResponse({ 
+        error: "Too many requests. Please try again later." 
+      }, 429);
+    }
+
+    // Add random delay to mimic human behavior
+    await randomDelay(500, 2000);
+
+    const { slideshareUrl, downloadFormat, quality = 'sd' } = await request.json();
+
+    // Validate URL
+    if (!slideshareUrl) {
+      return jsonResponse({ error: "Please enter a Slideshare URL" }, 400);
+    }
+
+    if (!slideshareUrl.match(/^https?:\/\/(www\.)?slideshare\.net\/.+/i)) {
+      return jsonResponse({ error: "Please enter a valid Slideshare URL" }, 400);
+    }
+
+    // Extract Slideshare ID from URL
+    const urlParts = new URL(slideshareUrl);
+    const pathParts = urlParts.pathname.split('/').filter(Boolean);
+    const slideId = pathParts[pathParts.length - 1];
+
+    if (!slideId) {
+      return jsonResponse({ error: "Could not extract presentation ID from URL" }, 400);
+    }
+
+    // Fetch the Slideshare page with enhanced stealth headers
+    const response = await fetch(slideshareUrl, {
+      headers: getBrowserHeaders(slideshareUrl),
+      redirect: 'follow'
+    });
+
+    if (!response.ok) {
+      // Add another delay before retry
+      await randomDelay(1000, 3000);
+      
+      // Retry with different headers
+      const retryResponse = await fetch(slideshareUrl, {
+        headers: getBrowserHeaders(slidesshareUrl),
+        redirect: 'follow'
+      });
+      
+      if (!retryResponse.ok) {
+        return jsonResponse({ error: "Could not fetch the Slideshare page" }, 400);
+      }
+    }
+
+    const html = await (response.ok ? response : await fetch(slideshareUrl, {
+      headers: getBrowserHeaders(slideshareUrl)
+    })).text();
+
+    // Extract the title with better error handling
+    const titleMatch = html.match(/<title>(.*?)<\/title>/);
+    const title = titleMatch ? titleMatch[1].replace(' | SlideShare', '').trim() : 'Slideshare Presentation';
+
+    // Enhanced patterns with more variations
+    const patterns = [
+      /"slide_image_baseurl":"([^"]+)"/gi,
+      /"slide_image_url":"([^"]+)"/gi,
+      /"slide_image":"([^"]+)"/gi,
+      /"normal":"([^"]+)"/gi,
+      /"large":"([^"]+)"/gi,
+      /"full":"([^"]+)"/gi,
+      /<img[^>]*data-full="([^"]+)"/gi,
+      /<img[^>]*data-large="([^"]+)"/gi,
+      /<img[^>]*data-normal="([^"]+)"/gi,
+      /<img[^>]*data-src="(https:\/\/image\.slidesharecdn\.com[^"]+)"/gi,
+      /<img[^>]*src="(https:\/\/image\.slidesharecdn\.com[^"]+)"/gi,
+      /https:\/\/image\.slidesharecdn\.com\/[^"'\s]*?-1024\.jpg/gi,
+      /https:\/\/image\.slidesharecdn\.com\/[^"'\s]*?-2048\.jpg/gi,
+      /https:\/\/image\.slidesharecdn\.com\/[^"'\s]*?-638\.jpg/gi
+    ];
+
+    let images = [];
+
+    // Try multiple extraction methods
+    for (const pattern of patterns) {
+      const matches = Array.from(html.matchAll(pattern));
+      if (matches.length > 0) {
+        images = matches.map(match => match[1] || match[0]).filter(Boolean);
+
+        // If we found base URLs, construct full image URLs
+        if (pattern.source.includes('slide_image_baseurl')) {
+          const baseUrl = images[0];
+          const slideCountMatch = html.match(/"total_slides":(\d+)/i) || 
+                                html.match(/"slideCount":(\d+)/i) ||
+                                html.match(/data-total-slides="(\d+)"/i);
+          const totalSlides = slideCountMatch ? parseInt(slideCountMatch[1]) : Math.min(images.length, 100);
+
+          images = [];
+          for (let i = 1; i <= totalSlides; i++) {
+            if (quality === 'hd') {
+              const hdUrl = baseUrl.replace('/85/', '/75/');
+              images.push(`${hdUrl}${i}-2048.jpg`);
+            } else {
+              images.push(`${baseUrl}${i}-638.jpg`);
+            }
+          }
+        }
+        
+        if (images.length > 0) break;
+      }
+    }
+
+    // Fallback: try to extract from JavaScript variables
+    if (images.length === 0) {
+      const jsMatches = html.match(/window\.__INITIAL_STATE__\s*=\s*(\{[\s\S]*?\});/) ||
+                       html.match(/window\.__REDUX_STATE__\s*=\s*(\{[\s\S]*?\});/) ||
+                       html.match(/var\s+slideshareData\s*=\s*(\{[\s\S]*?\});/);
+      
+      if (jsMatches) {
+        try {
+          const data = JSON.parse(jsMatches[1]);
+          // Extract images from JSON data structure
+          const extractImagesFromObject = (obj) => {
+            const found = [];
+            const search = (item) => {
+              if (typeof item === 'string' && item.includes('slidesharecdn.com')) {
+                found.push(item);
+              } else if (typeof item === 'object' && item !== null) {
+                Object.values(item).forEach(search);
+              }
+            };
+            search(obj);
+            return found;
+          };
+          
+          const extractedImages = extractImagesFromObject(data);
+          if (extractedImages.length > 0) {
+            images = extractedImages;
+          }
+        } catch (e) {
+          console.log('Failed to parse JS data:', e);
+        }
+      }
+    }
+
+    if (images.length === 0) {
+      return jsonResponse({ error: "Could not find slide images in the page" }, 400);
+    }
+
+    // Enhanced URL cleaning with better quality handling
+    images = images.map(url => {
+      url = url.replace(/\\\//g, '/');
+      if (!url.startsWith('http')) {
+        url = 'https:' + url;
+      }
+
+      // Remove various parameters
+      url = url.replace(/\?.*$/, '');
+      url = url.replace(/#.*$/, '');
+
+      // Replace thumbnail paths
+      url = url.replace(/\/ss_thumbnails\//, '/');
+      url = url.replace(/\/slidesharecdn\.com\/ss_thumbnails\//, '/slidesharecdn.com/');
+
+      // Handle quality-specific modifications
+      if (quality === 'hd') {
+        url = url.replace('/85/', '/75/');
+        url = url.replace(/-\d+\.jpg$/, '-2048.jpg');
+        if (!url.includes('-2048.jpg')) {
+          url = url.replace(/\.jpg$/, '-2048.jpg');
+        }
+      } else {
+        url = url.replace('/75/', '/85/');
+        url = url.replace(/-\d+\.jpg$/, '-638.jpg');
+        if (!url.includes('-638.jpg')) {
+          url = url.replace(/\.jpg$/, '-638.jpg');
+        }
+      }
+
+      return url;
+    });
+
+    // Remove duplicates and invalid URLs
+    const uniqueImages = new Set(images);
+    images = Array.from(uniqueImages).filter(url => 
+      url.includes('slidesharecdn.com') && 
+      url.includes('.jpg')
+    );
+
+    // Return the extracted data
+    return jsonResponse({
+      success: true,
+      title,
+      images,
+      totalSlides: images.length,
+      downloadFormat,
+      quality
+    });
+
+  } catch (error) {
+    console.error('SlideShare extraction error:', error);
+    return jsonResponse({ 
+      error: error.message || "An error occurred while processing the SlideShare URL" 
+    }, 500);
+  }
+}
+
+// Proxy image endpoint for CORS
+async function proxyImage(request) {
+  const url = new URL(request.url);
+  const imageUrl = url.searchParams.get('url');
+  if (!imageUrl || !imageUrl.includes('slidesharecdn.com')) {
+    return new Response('Invalid image URL', { status: 400 });
+  }
+
+  try {
+    const response = await fetch(imageUrl, {
+      headers: {
+        'User-Agent': getRandomUserAgent(),
+        'Accept': 'image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+        'Referer': 'https://www.slideshare.net/',
+      }
+    });
+
+    if (!response.ok) {
+      return new Response('Failed to fetch image', { status: response.status });
+    }
+
+    const headers = new Headers();
+    headers.set('Access-Control-Allow-Origin', '*');
+    headers.set('Content-Type', response.headers.get('Content-Type') || 'image/jpeg');
+    headers.set('Cache-Control', 'public, max-age=3600');
+
+    return new Response(response.body, { headers });
+  } catch (error) {
+    return new Response('Proxy error: ' + error.message, { status: 500 });
+  }
+}
+
+// Main Worker fetch handler
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    
+    // Handle CORS preflight requests
+    if (request.method === 'OPTIONS') {
+      return new Response(null, {
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+          'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+          'Access-Control-Max-Age': '86400',
+        }
+      });
+    }
+
+    // Health check endpoint
+    if (url.pathname === '/health' && request.method === 'GET') {
+      return jsonResponse({ 
+        status: 'OK', 
+        timestamp: new Date().toISOString(),
+        service: 'SlideShare Downloader API'
+      });
+    }
+
+    // Main API endpoint - handle both root and /api/slideshare
+    if ((url.pathname === '/' || url.pathname === '/api/slideshare') && request.method === 'POST') {
+      return processSlideShare(request);
+    }
+
+    // Conversion API endpoint
+    if (url.pathname === '/convert' && request.method === 'POST') {
+      try {
+        const { images, title, format } = await request.json();
+
+        if (!images || !Array.isArray(images) || images.length === 0) {
+          return jsonResponse(
+            { error: 'Images array is required and cannot be empty' },
+            400
+          );
+        }
+
+        if (!format || !['pdf', 'ppt', 'pptx'].includes(format.toLowerCase())) {
+          return jsonResponse(
+            { error: 'Format must be either "pdf", "ppt", or "pptx"' },
+            400
+          );
+        }
+
+        // Convert images to specified format
+        const blob = await convertImages(images, title || 'Converted Presentation', format);
+        
+        // Set appropriate headers for file download
+        const headers = new Headers();
+        headers.set('Access-Control-Allow-Origin', '*');
+        headers.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+        headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+        
+        if (format.toLowerCase() === 'pdf') {
+          headers.set('Content-Type', 'application/pdf');
+          headers.set('Content-Disposition', `attachment; filename="${title || 'presentation'}.pdf"`);
+        } else if (format.toLowerCase() === 'ppt' || format.toLowerCase() === 'pptx') {
+          headers.set('Content-Type', 'application/vnd.openxmlformats-officedocument.presentationml.presentation');
+          headers.set('Content-Disposition', `attachment; filename="${title || 'presentation'}.pptx"`);
+        }
+
+        return new Response(blob, { headers });
+
+      } catch (error) {
+        console.error('Conversion API error:', error);
+        return jsonResponse(
+          { error: 'Failed to convert files: ' + error.message },
+          500
+        );
+      }
+    }
+
+    // Proxy image endpoint
+    if (url.pathname === '/proxy-image' && request.method === 'GET') {
+      return proxyImage(request);
+    }
+
+    // Handle GET requests to main endpoint with helpful message
+    if (url.pathname === '/' || url.pathname === '/api/slideshare') {
+      return jsonResponse({
+        error: 'Method not allowed',
+        message: 'This endpoint only accepts POST requests',
+        usage: {
+          method: 'POST',
+          body: {
+            slideshareUrl: 'https://www.slideshare.net/...',
+            downloadFormat: 'pdf|ppt|zip (optional)',
+            quality: 'sd|hd (optional, default: sd)'
+          }
+        }
+      }, 405);
+    }
+
+    // 404 for other paths
+    return jsonResponse({ error: 'Not Found' }, 404);
+  }
+};
